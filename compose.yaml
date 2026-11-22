@@ -1,0 +1,98 @@
+# mcp-clamav: the MCP server plus the official ClamAV daemon, both hardened.
+#
+#   cp .env.example .env                                     # then fill in a token hash
+#   docker compose run --rm --no-deps mcp gen-token --label my-laptop
+#   docker compose up -d             # pulls ghcr.io/beecho01/mcp-clamav (add --build to build locally)
+#
+# Network layout:
+#   edge   - published MCP port (bound to 127.0.0.1 on the host by default)
+#   scan   - internal only: mcp <-> clamd. No internet egress, clamd port never published.
+#   egress - clamav only, so freshclam can download signature updates.
+
+name: mcp-clamav
+
+x-hardening: &hardening
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  restart: unless-stopped
+  logging:
+    driver: json-file
+    options: { max-size: "10m", max-file: "3" }
+
+services:
+  clamav:
+    <<: *hardening
+    # Official image from Cisco Talos (Debian variant: amd64 + arm64). Tracks the 1.5 line so ClamAV
+    # security patches arrive on pull.
+    image: clamav/clamav-debian:1.5
+    # Run clamd/freshclam as the image's unprivileged clamav user from the start (no root entrypoint).
+    user: "1000:1000"
+    environment:
+      FRESHCLAM_CHECKS: "12"  # signature update checks per day
+    volumes:
+      # Signatures persist across restarts so freshclam does not re-download ~300 MB each time.
+      - clamav-db:/var/lib/clamav
+      - ./docker/clamav/clamd.conf:/etc/clamav/clamd.conf:ro
+      - ./docker/clamav/freshclam.conf:/etc/clamav/freshclam.conf:ro
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=512m,uid=1000,gid=1000,mode=0750
+      - /run:rw,noexec,nosuid,nodev,size=8m,uid=1000,gid=1000
+      - /var/log/clamav:rw,noexec,nosuid,nodev,size=8m,uid=1000,gid=1000
+    networks: [scan, egress]
+    # clamd holds ~1 GiB of signatures and briefly double that while reloading updates.
+    mem_limit: 3g
+    pids_limit: 256
+    # Health check: the image's built-in clamdcheck.sh (PING over TCP), with a 6 minute start period.
+
+  mcp:
+    <<: *hardening
+    # Published multi-arch image; pin a release tag (e.g. :1.0.0) for reproducible deployments.
+    image: ${MCP_IMAGE:-ghcr.io/beecho01/mcp-clamav:latest}
+    build: .  # used by `docker compose up --build` / `docker compose build`
+    init: true
+    depends_on:
+      clamav:
+        condition: service_healthy
+    environment:
+      CLAMAV_MCP_TRANSPORT: http
+      CLAMAV_MCP_HOST: 0.0.0.0
+      CLAMAV_MCP_CLAMD_HOST: clamav
+      # Bearer tokens (hashes only). Required for HTTP: the server refuses to start without auth.
+      CLAMAV_MCP_AUTH_TOKEN_HASHES: ${CLAMAV_MCP_AUTH_TOKEN_HASHES:-}
+      # OAuth resource-server mode instead of static tokens (see README):
+      CLAMAV_MCP_OAUTH_ISSUER: ${CLAMAV_MCP_OAUTH_ISSUER:-}
+      CLAMAV_MCP_OAUTH_JWKS_URL: ${CLAMAV_MCP_OAUTH_JWKS_URL:-}
+      CLAMAV_MCP_OAUTH_RESOURCE_URL: ${CLAMAV_MCP_OAUTH_RESOURCE_URL:-}
+      CLAMAV_MCP_OAUTH_REQUIRED_SCOPES: ${CLAMAV_MCP_OAUTH_REQUIRED_SCOPES:-}
+      # DNS-rebinding protection: Host/Origin values clients may use to reach this server.
+      CLAMAV_MCP_ALLOWED_HOSTS: ${CLAMAV_MCP_ALLOWED_HOSTS:-127.0.0.1:*,localhost:*,[::1]:*}
+      CLAMAV_MCP_ALLOWED_ORIGINS: ${CLAMAV_MCP_ALLOWED_ORIGINS:-http://127.0.0.1:*,http://localhost:*,http://[::1]:*}
+      CLAMAV_MCP_MAX_INLINE_BYTES: ${CLAMAV_MCP_MAX_INLINE_BYTES:-10M}
+      CLAMAV_MCP_RATE_LIMIT_PER_MINUTE: ${CLAMAV_MCP_RATE_LIMIT_PER_MINUTE:-30}
+      CLAMAV_MCP_LOG_LEVEL: ${CLAMAV_MCP_LOG_LEVEL:-INFO}
+    ports:
+      # Loopback only. Put a TLS-terminating reverse proxy in front before exposing it further.
+      - "127.0.0.1:${MCP_PORT:-8000}:8000"
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=16m
+    networks: [scan, edge]
+    # Each in-flight 10 MiB inline scan holds roughly 40 MiB (JSON body, base64 text, decoded bytes).
+    mem_limit: 1g
+    cpus: 1.0
+    pids_limit: 128
+    healthcheck:
+      test: ["CMD", "clamav-mcp", "healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+networks:
+  scan:
+    internal: true
+  egress: {}
+  edge: {}
+
+volumes:
+  clamav-db: {}

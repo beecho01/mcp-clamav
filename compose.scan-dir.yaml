@@ -1,0 +1,19 @@
+# Optional overlay: let the MCP server read files from one host directory (read-only)
+# and expose the `scan_path` tool. Nothing outside SCAN_DIR is visible to the container.
+#
+#   SCAN_DIR=/home/me/Downloads docker compose -f compose.yaml -f compose.scan-dir.yaml up -d
+#
+# The container runs as uid 10001; files must be readable by it (world-readable), or set
+# MCP_UID/MCP_GID to your own user (`id -u`, `id -g`) so it runs with your permissions.
+
+services:
+  mcp:
+    user: "${MCP_UID:-10001}:${MCP_GID:-10001}"
+    environment:
+      CLAMAV_MCP_SCAN_ROOT: /scan
+      CLAMAV_MCP_MAX_FILE_BYTES: ${CLAMAV_MCP_MAX_FILE_BYTES:-100M}
+    volumes:
+      - type: bind
+        source: ${SCAN_DIR:?Set SCAN_DIR to the host directory to expose for scanning}
+        target: /scan
+        read_only: true
