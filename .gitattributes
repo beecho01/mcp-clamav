@@ -1,0 +1,6 @@
+# Everything here runs or is mounted inside Linux containers (clamd.conf, compose files, scripts),
+# so keep LF line endings even on Windows checkouts with core.autocrlf=true. clamd refuses
+# CRLF config files ("Incorrect argument format for option Foreground").
+* text=auto eol=lf
+
+*.png binary
